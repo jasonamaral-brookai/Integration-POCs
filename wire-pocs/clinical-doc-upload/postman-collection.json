@@ -1,0 +1,174 @@
+{
+  "info": {
+    "name": "athena Clinical Document Upload — POST clinicaldocument",
+    "description": "Pillar: Clinical Document Upload (Phase 1b)\nEndpoint: POST /v1/{practiceid}/patients/{patientid}/documents/clinicaldocument\n\nTHIS IS LIVE CODE. AthenaService.java and AthenaApi.java already post PDF care plans to this endpoint in production for Griffin with documentTypeId=440672 hardcoded. This collection demonstrates the parameterized form.\n\nRequired Postman environment variables:\n  athena_client_id\n  athena_client_secret\n  athena_practice_id\n  athena_patient_id\n  athena_document_type_id (default: 440672)\n  athena_base_url",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Step 1 — Acquire OAuth2 Token",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const clientId = pm.environment.get('athena_client_id');",
+              "const clientSecret = pm.environment.get('athena_client_secret');",
+              "if (!clientId || !clientSecret) {",
+              "    throw new Error('athena_client_id and athena_client_secret must be set');",
+              "}",
+              "const credentials = btoa(clientId + ':' + clientSecret);",
+              "pm.environment.set('athena_basic_auth', 'Basic ' + credentials);"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Token acquired', function () {",
+              "    pm.response.to.have.status(200);",
+              "    const json = pm.response.json();",
+              "    pm.expect(json.access_token).to.be.a('string').and.not.empty;",
+              "    pm.environment.set('athena_access_token', json.access_token);",
+              "});"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {"key": "Authorization", "value": "{{athena_basic_auth}}"},
+          {"key": "Content-Type", "value": "application/x-www-form-urlencoded"}
+        ],
+        "body": {
+          "mode": "urlencoded",
+          "urlencoded": [{"key": "grant_type", "value": "client_credentials"}]
+        },
+        "url": {
+          "raw": "{{athena_base_url}}/oauth2/v1/token",
+          "host": ["{{athena_base_url}}"],
+          "path": ["oauth2", "v1", "token"]
+        }
+      }
+    },
+    {
+      "name": "Step 2 — POST Clinical Document",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const token = pm.environment.get('athena_access_token');",
+              "if (!token) {",
+              "    throw new Error('athena_access_token not set — run Step 1 first');",
+              "}",
+              "",
+              "// Generate idempotency key: SHA-256 of compound key (approximated in JS)",
+              "const patientId = pm.environment.get('athena_patient_id') || '';",
+              "const practiceId = pm.environment.get('athena_practice_id') || '';",
+              "const docTypeId = pm.environment.get('athena_document_type_id') || '440672';",
+              "const now = new Date();",
+              "const period = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0');",
+              "const compound = 'persona:' + patientId + ':practice:' + practiceId + ':doctype:' + docTypeId + ':period:' + period + ':v1';",
+              "// Simple hash approximation for Postman (use crypto-js for production-grade)",
+              "let hash = 0;",
+              "for (let i = 0; i < compound.length; i++) {",
+              "    hash = ((hash << 5) - hash) + compound.charCodeAt(i);",
+              "    hash |= 0;",
+              "}",
+              "pm.environment.set('athena_idempotency_key', Math.abs(hash).toString(16).padStart(8, '0') + '-doc-upload-' + period);",
+              "pm.environment.set('athena_document_period', period);",
+              "pm.environment.set('athena_document_filename', 'care_plan_' + period + '_' + patientId + '.pdf');"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Upload successful (200 or 201)', function () {",
+              "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
+              "});",
+              "",
+              "// 409 = idempotent duplicate (already uploaded) — not an error",
+              "if (pm.response.code === 409) {",
+              "    console.log('HTTP 409: Document already exists — idempotent. Not an error.');",
+              "}",
+              "",
+              "if (pm.response.code >= 400 && pm.response.code !== 409) {",
+              "    console.error('Upload failed: ' + pm.response.code);",
+              "    console.error('Body: ' + pm.response.text());",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{athena_access_token}}"
+          },
+          {
+            "key": "X-Idempotency-Key",
+            "value": "{{athena_idempotency_key}}",
+            "description": "Compound key: persona+practice+doctype+period — prevents duplicate uploads"
+          }
+        ],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "file",
+              "type": "file",
+              "src": "",
+              "description": "PDF care plan document. Set src to a local PDF file path in Postman."
+            },
+            {
+              "key": "documentsubclass",
+              "value": "CLINICALDOCUMENT",
+              "type": "text",
+              "description": "Hardcoded in AthenaService.java:52. Matches athena's clinical document category."
+            },
+            {
+              "key": "autoclose",
+              "value": "true",
+              "type": "text",
+              "description": "Hardcoded in AthenaService.java. Confirm with Griffin if this should be parameterizable."
+            },
+            {
+              "key": "documenttypeid",
+              "value": "{{athena_document_type_id}}",
+              "type": "text",
+              "description": "HARDCODED_TODO_RISK: Production has 440672 hardcoded with //TODO comment. Set athena_document_type_id in environment. Default: 440672 (Griffin bundle report)."
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{athena_base_url}}/v1/{{athena_practice_id}}/patients/{{athena_patient_id}}/documents/clinicaldocument",
+          "host": ["{{athena_base_url}}"],
+          "path": ["v1", "{{athena_practice_id}}", "patients", "{{athena_patient_id}}", "documents", "clinicaldocument"]
+        },
+        "description": "POST a PDF clinical document to athena. Matches AthenaApi.java endpoint confirmed in brook-backend. documenttypeid is parameterized here (hardcoded to 440672 in production — see HARDCODED_TODO_RISK note)."
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "athena_base_url",
+      "value": "https://api.preview.platform.athenahealth.com"
+    },
+    {
+      "key": "athena_document_type_id",
+      "value": "440672",
+      "description": "Griffin bundle report document type. HARDCODED in production — mapping config will parameterize this."
+    }
+  ]
+}

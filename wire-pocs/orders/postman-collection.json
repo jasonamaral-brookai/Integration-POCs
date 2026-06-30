@@ -1,0 +1,202 @@
+{
+  "info": {
+    "name": "athena Orders — Create Lab Order + Status Check",
+    "description": "Pillar: Orders (Phase 3)\nEndpoints:\n  POST /v1/{practiceid}/patients/{patientid}/orders/lab\n  GET  /v1/{practiceid}/patients/{patientid}/orders/{orderid}\n\nTODO: Verify all endpoint paths against athena developer docs.\nAll order endpoint paths in this collection are approximate and must be validated in sandbox.\n\nClassical vs. Postmodern:\n  Classical: Physician places order in athena directly.\n  Postmodern (Griffin): Brook drafts, physician signs in athena task queue.\n  This collection demonstrates the Brook-drafts side.\n\nRequired Postman environment variables:\n  athena_client_id\n  athena_client_secret\n  athena_practice_id\n  athena_patient_id\n  athena_department_id\n  athena_provider_id\n  athena_base_url",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Step 1 — Acquire OAuth2 Token",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const clientId = pm.environment.get('athena_client_id');",
+              "const clientSecret = pm.environment.get('athena_client_secret');",
+              "if (!clientId || !clientSecret) {",
+              "    throw new Error('athena_client_id and athena_client_secret must be set');",
+              "}",
+              "const credentials = btoa(clientId + ':' + clientSecret);",
+              "pm.environment.set('athena_basic_auth', 'Basic ' + credentials);"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Token acquired', function () {",
+              "    pm.response.to.have.status(200);",
+              "    const json = pm.response.json();",
+              "    pm.expect(json.access_token).to.be.a('string').and.not.empty;",
+              "    pm.environment.set('athena_access_token', json.access_token);",
+              "});"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {"key": "Authorization", "value": "{{athena_basic_auth}}"},
+          {"key": "Content-Type", "value": "application/x-www-form-urlencoded"}
+        ],
+        "body": {
+          "mode": "urlencoded",
+          "urlencoded": [{"key": "grant_type", "value": "client_credentials"}]
+        },
+        "url": {
+          "raw": "{{athena_base_url}}/oauth2/v1/token",
+          "host": ["{{athena_base_url}}"],
+          "path": ["oauth2", "v1", "token"]
+        }
+      }
+    },
+    {
+      "name": "Step 2 — POST Lab Order",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const token = pm.environment.get('athena_access_token');",
+              "if (!token) { throw new Error('Run Step 1 first'); }",
+              "// Generate idempotency key",
+              "const patientId = pm.environment.get('athena_patient_id') || '';",
+              "const now = new Date();",
+              "const hourBucket = now.toISOString().slice(0, 13);",
+              "pm.environment.set('athena_idempotency_key', 'orders-lab-' + patientId + '-' + hourBucket);"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Order created (200 or 201)', function () {",
+              "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
+              "});",
+              "",
+              "// Extract order ID for status check",
+              "if (pm.response.code < 300) {",
+              "    try {",
+              "        const json = pm.response.json();",
+              "        if (json.orderid || json.id) {",
+              "            const orderId = json.orderid || json.id;",
+              "            pm.environment.set('athena_order_id', String(orderId));",
+              "            console.log('Order created. ID: ' + orderId);",
+              "        }",
+              "    } catch (e) {",
+              "        console.log('Response body: ' + pm.response.text());",
+              "    }",
+              "}",
+              "",
+              "if (pm.response.code >= 400) {",
+              "    console.error('Order creation failed: ' + pm.response.status);",
+              "    console.error('Body: ' + pm.response.text());",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {"key": "Authorization", "value": "Bearer {{athena_access_token}}"},
+          {"key": "Content-Type", "value": "application/x-www-form-urlencoded"},
+          {
+            "key": "X-Idempotency-Key",
+            "value": "{{athena_idempotency_key}}",
+            "description": "Dedup protection — same key = same order, not a duplicate"
+          }
+        ],
+        "body": {
+          "mode": "urlencoded",
+          "urlencoded": [
+            {
+              "key": "diagnosiscode",
+              "value": "E11.65",
+              "description": "ICD-10 diagnosis code. E11.65 = T2DM with hyperglycemia (common Brook patient population)"
+            },
+            {
+              "key": "departmentid",
+              "value": "{{athena_department_id}}",
+              "description": "athena department ID — from ProviderOffice.emrDetails.Athena.departmentId in Brook"
+            },
+            {
+              "key": "providerid",
+              "value": "{{athena_provider_id}}",
+              "description": "Ordering provider ID — from ProviderDetails.leadProviderId in Brook"
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{athena_base_url}}/v1/{{athena_practice_id}}/patients/{{athena_patient_id}}/orders/lab",
+          "host": ["{{athena_base_url}}"],
+          "path": ["v1", "{{athena_practice_id}}", "patients", "{{athena_patient_id}}", "orders", "lab"],
+          "description": "TODO: verify endpoint path against athena developer docs. All order field names are approximate."
+        }
+      }
+    },
+    {
+      "name": "Step 3 — GET Order Status",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const token = pm.environment.get('athena_access_token');",
+              "if (!token) { throw new Error('Run Step 1 first'); }",
+              "const orderId = pm.environment.get('athena_order_id');",
+              "if (!orderId) { throw new Error('athena_order_id not set — run Step 2 first or set manually'); }"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Order status returned (200)', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "",
+              "if (pm.response.code === 200) {",
+              "    try {",
+              "        const json = pm.response.json();",
+              "        const status = json.status || json.orderstatus || 'unknown';",
+              "        console.log('Order status: ' + status);",
+              "        // Postmodern flow: wait for status = SIGNED or COMPLETE",
+              "        if (status === 'SIGNED' || status === 'COMPLETE') {",
+              "            console.log('Order signed by provider — Brook can activate patient');",
+              "        }",
+              "    } catch (e) {",
+              "        console.log('Status body: ' + pm.response.text());",
+              "    }",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [{"key": "Authorization", "value": "Bearer {{athena_access_token}}"}],
+        "url": {
+          "raw": "{{athena_base_url}}/v1/{{athena_practice_id}}/patients/{{athena_patient_id}}/orders/{{athena_order_id}}",
+          "host": ["{{athena_base_url}}"],
+          "path": ["v1", "{{athena_practice_id}}", "patients", "{{athena_patient_id}}", "orders", "{{athena_order_id}}"],
+          "description": "TODO: verify endpoint path against athena developer docs. Status field name (status, orderstatus) TBD."
+        }
+      }
+    }
+  ],
+  "variable": [
+    {"key": "athena_base_url", "value": "https://api.preview.platform.athenahealth.com"}
+  ]
+}

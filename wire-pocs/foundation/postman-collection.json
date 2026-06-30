@@ -1,0 +1,105 @@
+{
+  "info": {
+    "name": "athena Foundation — OAuth2 Token",
+    "description": "Pillar: Foundation (P0)\nEndpoint: POST /oauth2/v1/token\nDemonstrates athena OAuth2 client credentials grant.\n\nSet environment variables before running:\n  athena_client_id\n  athena_client_secret\n  athena_practice_id\n  athena_base_url (default: https://api.preview.platform.athenahealth.com)",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Acquire OAuth2 Token",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Read credentials from Postman environment",
+              "const clientId = pm.environment.get('athena_client_id');",
+              "const clientSecret = pm.environment.get('athena_client_secret');",
+              "",
+              "if (!clientId || !clientSecret) {",
+              "    throw new Error('athena_client_id and athena_client_secret must be set in the Postman environment');",
+              "}",
+              "",
+              "// Build Basic auth header: base64(client_id:client_secret)",
+              "const credentials = btoa(clientId + ':' + clientSecret);",
+              "pm.environment.set('athena_basic_auth', 'Basic ' + credentials);",
+              "",
+              "// Generate a deterministic idempotency key (hour-bucketed)",
+              "const now = new Date();",
+              "const hourBucket = now.toISOString().slice(0, 13) + ':00:00Z';",
+              "pm.environment.set('athena_idempotency_key', 'token-request-' + hourBucket);"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "",
+              "pm.test('Response has access_token', function () {",
+              "    const json = pm.response.json();",
+              "    pm.expect(json).to.have.property('access_token');",
+              "    pm.expect(json.access_token).to.be.a('string').and.not.empty;",
+              "    // Store for use in downstream requests",
+              "    pm.environment.set('athena_access_token', json.access_token);",
+              "    pm.environment.set('athena_token_type', json.token_type || 'Bearer');",
+              "});",
+              "",
+              "pm.test('Response has expires_in', function () {",
+              "    const json = pm.response.json();",
+              "    pm.expect(json).to.have.property('expires_in');",
+              "    pm.expect(json.expires_in).to.be.a('number').and.above(0);",
+              "});"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "{{athena_basic_auth}}",
+            "description": "Basic base64(client_id:client_secret) — set by pre-request script"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/x-www-form-urlencoded"
+          },
+          {
+            "key": "X-Idempotency-Key",
+            "value": "{{athena_idempotency_key}}",
+            "description": "Informational idempotency key; hour-bucketed to match retry window"
+          }
+        ],
+        "body": {
+          "mode": "urlencoded",
+          "urlencoded": [
+            {
+              "key": "grant_type",
+              "value": "client_credentials"
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{athena_base_url}}/oauth2/v1/token",
+          "host": ["{{athena_base_url}}"],
+          "path": ["oauth2", "v1", "token"]
+        },
+        "description": "OAuth2 client credentials grant. athena returns access_token + expires_in. The test script stores the token in athena_access_token for downstream requests."
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "athena_base_url",
+      "value": "https://api.preview.platform.athenahealth.com",
+      "description": "Sandbox: https://api.preview.platform.athenahealth.com | Production: https://api.platform.athenahealth.com"
+    }
+  ]
+}

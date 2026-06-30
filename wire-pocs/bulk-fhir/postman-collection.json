@@ -1,0 +1,257 @@
+{
+  "info": {
+    "name": "athena Bulk FHIR Export — Async Three-Step Pattern",
+    "description": "Pillar: Bulk FHIR (Phase 4)\nFHIR R4 Bulk Data Access IG — async pattern:\n  1. Initiate: GET /fhir/r4/Patient/$export (202 + Content-Location poll URL)\n  2. Poll: GET <poll_url> until 200 (manifest) or error\n  3. Download: GET each output[].url (NDJSON files)\n\nTODO: Verify athena FHIR base URL and $export path against athena developer docs.\n\nRequired Postman environment variables:\n  athena_client_id\n  athena_client_secret\n  athena_practice_id\n  athena_base_url\n\nOptional:\n  athena_fhir_resource_types (default: Patient,Condition,Observation)\n  athena_fhir_since (ISO8601 timestamp for incremental export)",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Step 1 — Acquire OAuth2 Token",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const clientId = pm.environment.get('athena_client_id');",
+              "const clientSecret = pm.environment.get('athena_client_secret');",
+              "if (!clientId || !clientSecret) {",
+              "    throw new Error('athena_client_id and athena_client_secret must be set');",
+              "}",
+              "const credentials = btoa(clientId + ':' + clientSecret);",
+              "pm.environment.set('athena_basic_auth', 'Basic ' + credentials);"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Token acquired', function () {",
+              "    pm.response.to.have.status(200);",
+              "    const json = pm.response.json();",
+              "    pm.expect(json.access_token).to.be.a('string').and.not.empty;",
+              "    pm.environment.set('athena_access_token', json.access_token);",
+              "});"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {"key": "Authorization", "value": "{{athena_basic_auth}}"},
+          {"key": "Content-Type", "value": "application/x-www-form-urlencoded"}
+        ],
+        "body": {
+          "mode": "urlencoded",
+          "urlencoded": [{"key": "grant_type", "value": "client_credentials"}]
+        },
+        "url": {
+          "raw": "{{athena_base_url}}/oauth2/v1/token",
+          "host": ["{{athena_base_url}}"],
+          "path": ["oauth2", "v1", "token"]
+        }
+      }
+    },
+    {
+      "name": "Step 2 — Initiate Bulk FHIR Export",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const token = pm.environment.get('athena_access_token');",
+              "if (!token) { throw new Error('Run Step 1 first'); }",
+              "// Set default resource types if not configured",
+              "if (!pm.environment.get('athena_fhir_resource_types')) {",
+              "    pm.environment.set('athena_fhir_resource_types', 'Patient,Condition,Observation,AllergyIntolerance,MedicationRequest,Encounter');",
+              "}"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Export initiated (202 Accepted)', function () {",
+              "    pm.response.to.have.status(202);",
+              "});",
+              "",
+              "// Extract Content-Location poll URL",
+              "const pollUrl = pm.response.headers.get('Content-Location');",
+              "if (pollUrl) {",
+              "    pm.environment.set('athena_bulk_poll_url', pollUrl);",
+              "    console.log('Poll URL: ' + pollUrl);",
+              "} else {",
+              "    console.warn('No Content-Location header in 202 response — cannot poll');",
+              "}",
+              "",
+              "pm.test('Content-Location header present', function () {",
+              "    pm.expect(pm.response.headers.has('Content-Location')).to.be.true;",
+              "});"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [
+          {"key": "Authorization", "value": "Bearer {{athena_access_token}}"},
+          {"key": "Accept", "value": "application/fhir+json"},
+          {
+            "key": "Prefer",
+            "value": "respond-async",
+            "description": "Required by FHIR Bulk Data Access IG to trigger async export"
+          }
+        ],
+        "url": {
+          "raw": "{{athena_base_url}}/fhir/r4/Patient/$export?_type={{athena_fhir_resource_types}}",
+          "host": ["{{athena_base_url}}"],
+          "path": ["fhir", "r4", "Patient", "$export"],
+          "query": [
+            {
+              "key": "_type",
+              "value": "{{athena_fhir_resource_types}}",
+              "description": "Comma-separated FHIR resource types"
+            },
+            {
+              "key": "_since",
+              "value": "{{athena_fhir_since}}",
+              "description": "ISO8601 timestamp for incremental export (optional)",
+              "disabled": true
+            }
+          ],
+          "description": "TODO: verify athena FHIR base URL and $export path. Alternative: /fhir/r4/{{athena_practice_id}}/Patient/$export"
+        }
+      }
+    },
+    {
+      "name": "Step 3 — Poll Export Status",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const pollUrl = pm.environment.get('athena_bulk_poll_url');",
+              "if (!pollUrl) {",
+              "    throw new Error('athena_bulk_poll_url not set — run Step 2 first');",
+              "}"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// 202 = still in progress; 200 = complete",
+              "if (pm.response.code === 202) {",
+              "    const progress = pm.response.headers.get('X-Progress') || 'in progress';",
+              "    console.log('Export in progress: ' + progress + ' — re-run this request to poll again');",
+              "}",
+              "",
+              "if (pm.response.code === 200) {",
+              "    pm.test('Manifest returned', function () {",
+              "        pm.response.to.have.status(200);",
+              "    });",
+              "    try {",
+              "        const manifest = pm.response.json();",
+              "        const fileCount = (manifest.output || []).length;",
+              "        console.log('Export complete. Files: ' + fileCount);",
+              "        if (fileCount > 0) {",
+              "            // Store first file URL for Step 4",
+              "            pm.environment.set('athena_bulk_file_url', manifest.output[0].url);",
+              "            console.log('First file URL: ' + manifest.output[0].url);",
+              "        }",
+              "        const errors = (manifest.error || []).length;",
+              "        if (errors > 0) {",
+              "            console.warn('Export completed with ' + errors + ' error(s)');",
+              "        }",
+              "    } catch (e) {",
+              "        console.error('Failed to parse manifest: ' + e.message);",
+              "    }",
+              "}",
+              "",
+              "if (pm.response.code >= 400) {",
+              "    console.error('Export failed: ' + pm.response.status);",
+              "    console.error(pm.response.text());",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [
+          {"key": "Authorization", "value": "Bearer {{athena_access_token}}"},
+          {"key": "Accept", "value": "application/json"}
+        ],
+        "url": {
+          "raw": "{{athena_bulk_poll_url}}",
+          "host": ["{{athena_bulk_poll_url}}"],
+          "description": "Poll URL from Content-Location header of Step 2. Run repeatedly until 200."
+        }
+      }
+    },
+    {
+      "name": "Step 4 — Download NDJSON File",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const fileUrl = pm.environment.get('athena_bulk_file_url');",
+              "if (!fileUrl) {",
+              "    throw new Error('athena_bulk_file_url not set — run Step 3 first (set from manifest output[0].url)');",
+              "}"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('NDJSON file returned (200)', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "",
+              "if (pm.response.code === 200) {",
+              "    const lines = pm.response.text().split('\\n').filter(l => l.trim());",
+              "    console.log('FHIR resources in file: ' + lines.length);",
+              "    if (lines.length > 0) {",
+              "        try {",
+              "            const first = JSON.parse(lines[0]);",
+              "            console.log('First resource type: ' + first.resourceType);",
+              "            console.log('First resource id: ' + first.id);",
+              "        } catch(e) {}",
+              "    }",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [
+          {"key": "Authorization", "value": "Bearer {{athena_access_token}}"},
+          {"key": "Accept", "value": "application/fhir+ndjson"}
+        ],
+        "url": {
+          "raw": "{{athena_bulk_file_url}}",
+          "host": ["{{athena_bulk_file_url}}"],
+          "description": "NDJSON file URL from manifest output[]. One FHIR resource JSON per line."
+        }
+      }
+    }
+  ],
+  "variable": [
+    {"key": "athena_base_url", "value": "https://api.preview.platform.athenahealth.com"}
+  ]
+}
