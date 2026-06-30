@@ -1,0 +1,196 @@
+# athena.yaml — Partner-keyed mapping configuration for the athena EHR integration.
+#
+# This config drives how the mapping layer translates athena CCDA documents
+# into Brook clinical entity shapes. The partner key "athena" scopes all settings
+# to this EHR partner — a future griffin.yaml or epic.yaml would be a sibling file
+# with the same schema.
+#
+# Brooks's mapping config (from findings.md):
+#   No mapping config schema (YAML, JSON, DSL) of any kind found in any scanned repo.
+#   All transform logic for Redox ingest is hardcoded in RedoxService.java (82.7KB).
+#   File: /tmp/brook-backend/src/main/java/ai/brook/api/rpm/emr/redox/RedoxService.java
+#   This config schema is genuine greenfield — the anti-pattern the integration
+#   platform is designed to replace.
+#
+# Schema version allows non-breaking additions. Breaking changes bump major version.
+# See: IDEA-29 Schema versioning and partner update framework.
+
+schema_version: "1.0"
+
+partner:
+  key: "athena"
+  display_name: "athenahealth"
+  practice_id_env: "ATHENA_PRACTICE_ID"     # env var name for practice ID
+  base_url: "https://api.platform.athenahealth.com"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Auth configuration
+# ──────────────────────────────────────────────────────────────────────────────
+auth:
+  type: "oauth2_client_credentials"
+  token_endpoint: "https://api.platform.athenahealth.com/oauth2/v1/token"
+  client_id_env: "ATHENA_CLIENT_ID"          # env var name
+  client_secret_env: "ATHENA_CLIENT_SECRET"  # env var name
+  # Brook code precedent: AthenaApiService.java uses @Value("${athena.client-id}")
+  # and @Value("${athena.client-secret}") for injection.
+  # File: /tmp/brook-backend/src/main/java/ai/brook/api/rpm/emr/athena/api/AthenaApiService.java:40-43
+
+# ──────────────────────────────────────────────────────────────────────────────
+# HTTP client defaults
+# ──────────────────────────────────────────────────────────────────────────────
+http:
+  connect_timeout_seconds: 60
+  read_timeout_seconds: 180
+  max_retries: 3
+  initial_backoff_seconds: 2.0
+  backoff_multiplier: 2.0
+  max_backoff_seconds: 30.0
+  # Retry-After header honored when present (HTTP 429 responses).
+  # Java precedent: ExponentialBackoffInterceptor.java — exists in brook-backend
+  # but not wired into production athena client as of the recon scan.
+  # File: /tmp/brook-backend/src/main/java/ai/brook/utils/ExponentialBackoffInterceptor.java
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Idempotency
+# ──────────────────────────────────────────────────────────────────────────────
+idempotency:
+  ccda_inbound:
+    key_components:
+      - "patient_id"
+      - "document_type"
+      - "date_bucket"          # daily bucket — YYYY-MM-DD
+    # Brook outbound idempotency precedent uses (personaId, providerOfficeId,
+    # month-in-filename, type) via EmrLog collection (compound unique index).
+    # File: /tmp/brook-backend/src/main/java/ai/brook/api/rpm/emr/model/EmrLog.java
+    # For CCDA inbound, date_bucket replaces month — CCDA is stable within a day.
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CCDA section mappings
+#
+# Each section is keyed by its LOINC code (C-CDA R2.1 section codes).
+# The "brook_entity" value names the target entity shape.
+# The "source" value is the DiagnosisSource / entity Source enum value — must
+# be added to the respective Java enum before production wiring.
+# (See data-model-gaps.md: "ATHENA_CCDA source value not in DiagnosisSource enum")
+#
+# Future partner config (e.g., griffin.yaml) would override sections or add
+# partner-specific field overrides under a partner_overrides key.
+# ──────────────────────────────────────────────────────────────────────────────
+ccda_sections:
+
+  problem_list:
+    loinc_code: "11450-4"
+    display_name: "Problem List"
+    brook_entity: "PersonaProblem"
+    # NOTE: CCDA problem list entries may route to PersonaDiagnosis (source=ATHENA_CCDA)
+    # if the Backend team decides persona.diagnoses[] is the canonical store.
+    # See data-model-gaps.md — Persistence Decision Question #1.
+    # When that decision is made, update brook_entity here without touching mapper code.
+    source: "ATHENA_CCDA"
+    enabled: true
+    field_map:
+      source_id: "observation/@extension"          # EHR-assigned problem ID
+      icd10_code: "value/@code"                    # ICD-10-CM code
+      display_name: "value/@displayName"           # Human-readable condition name
+      clinical_status: "statusCode/@code"          # active → ACTIVE
+      onset_date: "effectiveTime/low/@value"       # CCDA low time = onset
+
+  medications:
+    loinc_code: "10160-0"
+    display_name: "History of Medication Use"
+    brook_entity: "PersonaMedication"
+    source: "ATHENA_CCDA"
+    enabled: true
+    field_map:
+      source_id: "substanceAdministration/id/@extension"
+      medication_name: "consumable/manufacturedProduct/manufacturedMaterial/code/@displayName"
+      rx_norm_code: "consumable/manufacturedProduct/manufacturedMaterial/code/@code"
+      status: "statusCode/@code"                   # active → ACTIVE
+      dosage_text: "text"                          # full SIG text node
+      dose_value: "doseQuantity/@value"
+      dose_unit: "doseQuantity/@unit"
+      route: "routeCode/@displayName"
+      effective_start: "effectiveTime/low/@value"
+      effective_end: "effectiveTime/high/@value"   # null if currently active
+
+  encounters:
+    loinc_code: "46240-8"
+    display_name: "Encounter History"
+    brook_entity: "PersonaEncounter"
+    source: "ATHENA_CCDA"
+    enabled: true
+    field_map:
+      source_id: "encounter/id/@extension"
+      encounter_type: "encounter/code/@displayName"
+      period_start: "encounter/effectiveTime/low/@value"
+      period_end: "encounter/effectiveTime/high/@value"
+      location_name: "encounter/participant[@typeCode='LOC']/participantRole/playingEntity/name"
+      provider_name: "encounter/performer/assignedEntity/assignedPerson/name"
+      provider_npi: "encounter/performer/assignedEntity/id/@extension"
+      reason_code: "encounter/entryRelationship/observation/value/@code"
+      reason_display: "encounter/entryRelationship/observation/value/@displayName"
+
+  allergies:
+    loinc_code: "48765-2"
+    display_name: "Allergies, Adverse Reactions, Alerts"
+    brook_entity: "PersonaAllergy"
+    source: "ATHENA_CCDA"
+    enabled: true
+    field_map:
+      source_id: "act/id/@extension"
+      clinical_status: "act/statusCode/@code"      # active → ACTIVE
+      allergen_name: "act/entryRelationship/observation/participant/participantRole/playingEntity/name"
+      rx_norm_code: "act/entryRelationship/observation/participant/participantRole/playingEntity/code/@code"
+      allergy_type_code: "act/entryRelationship/observation/code/@code"
+      onset_date: "act/entryRelationship/observation/effectiveTime/low/@value"
+      reaction_display: "act/entryRelationship/observation/entryRelationship/observation/value/@displayName"
+      reaction_snomed: "act/entryRelationship/observation/entryRelationship/observation/value/@code"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Status code normalization
+#
+# Maps athena/C-CDA status strings to Brook enum values.
+# A future griffin.yaml partner override could add Griffin-specific status codes.
+# ──────────────────────────────────────────────────────────────────────────────
+status_normalizations:
+  clinical_status:
+    "active": "ACTIVE"
+    "inactive": "INACTIVE"
+    "completed": "RESOLVED"
+    "resolved": "RESOLVED"
+
+  medication_status:
+    "active": "ACTIVE"
+    "inactive": "INACTIVE"
+    "completed": "STOPPED"
+    "suspended": "ON_HOLD"
+    "cancelled": "STOPPED"
+
+  encounter_status:
+    "active": "IN_PROGRESS"
+    "completed": "FINISHED"
+    "cancelled": "CANCELLED"
+    "aborted": "CANCELLED"
+
+  verification_status:
+    "confirmed": "CONFIRMED"
+    "unconfirmed": "UNCONFIRMED"
+    "refuted": "REFUTED"
+
+  allergy_type_codes:
+    "416098002": "ALLERGY"    # SNOMED: Drug allergy
+    "59037007": "INTOLERANCE" # SNOMED: Drug intolerance
+    "414285001": "ALLERGY"    # SNOMED: Food allergy
+    "420134006": "ALLERGY"    # SNOMED: Propensity to adverse reactions (food)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Output controls — which entities to emit events for
+# ──────────────────────────────────────────────────────────────────────────────
+event_emission:
+  enabled_entities:
+    - "PersonaProblem"
+    - "PersonaMedication"
+    - "PersonaEncounter"
+    - "PersonaAllergy"
+  event_name_template: "CCDA_{entity_type}_INGESTED"
+  # e.g., CCDA_PersonaMedication_INGESTED
