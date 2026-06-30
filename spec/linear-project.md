@@ -30,7 +30,7 @@ Two workstreams. Both required for v1 athena. Neither ships alone for Phase 1a.
 Build the partner-agnostic platform layer: event bus contracts, auth/secrets scaffolding, base HTTP client (wire `ExponentialBackoffInterceptor.java` into OkHttp builders — it exists but is disconnected from production EMR calls; findings.md, recon summary #5), mapping config schema (YAML or JSON, partner-keyed; zero existing implementation, genuine greenfield; findings.md "Mapping config schema"), and observability via Integration Health Dashboard. The "Integration Event Worker (Go)" referenced in the build plan was not found in any scanned repo (findings.md, "Plan Assumptions I Could Not Verify" #1) — the event substrate decision is open (see Key Decision 7).
 
 **P1a — CCDA Inbound**
-Build GET `/v1/{practiceid}/ccda/{patientid}/ccda` retrieval, CDA parser, CCDA-to-Persona entity mappers, and POCAR trigger (nurse-on-demand pull). Zero existing code for any of these components; the athena OAuth2 client in `AthenaApiService.java` is the only reusable piece (findings.md, "CCDA Inbound"). The `last_pocar_opened_at` signal already propagates through care-nexus on chart open and is the natural hook, but nothing downstream of it triggers a data fetch today (findings.md, "POCAR / Care Team UI"). Requires `brook-web-app` (Angular) changes plus a new `brook-backend` API endpoint.
+Build GET `/v1/{practiceid}/ccda/{patientid}/ccda` retrieval, CDA parser, CCDA adapters (encounter adapter, medication adapter, allergy adapter, diagnosis adapter, lab adapter, vital adapter), and POCAR trigger (nurse-on-demand pull). Zero existing code for any of these components; the athena OAuth2 client in `AthenaApiService.java` is the only reusable piece (findings.md, "CCDA Inbound"). The `last_pocar_opened_at` signal already propagates through care-nexus on chart open and is the natural hook, but nothing downstream of it triggers a data fetch today (findings.md, "POCAR / Care Team UI"). Requires `brook-web-app` (Angular) changes plus a new `brook-backend` API endpoint.
 
 **P1b — Clinical Document Upload (refactor, not greenfield)**
 Refactor `AthenaService.java` and `AthenaApi.java` to replace hardcoded `documentTypeId=440672` with mapping config, add event-driven trigger (currently batch-scheduled via `GenericQueueProcessor` with `GENERATE_BUNDLED_REPORT` action), and upgrade idempotency key from filename-based to event-version-based. This code is live and shipping to Griffin today. The migration plan and parallel-run window are open decisions (Key Decision 9).
@@ -89,9 +89,9 @@ Options:
   A. New discrete collection per entity (PersonaEncounter, PersonaMedication, PersonaAllergy, PersonaLab) — clean FHIR alignment, new collections to maintain, new display paths required.
   B. Extend existing collections (enhance `patient_care_plans` embedded documents with coded fields, extend `activity` with new SourceType values) — lowest friction, reuses billing infrastructure, may pollute RPM billing queries that assume `activity` = device readings only.
   C. Hybrid: discrete collections for Encounter and Allergy (clinical safety case); extend existing for Medication and Vital — balances risk against friction.
-Owner: Backend, DNA
-Blocker: No CCDA mapper can be implemented until persistence targets are defined for each entity.
-Impact if deferred: The CCDA parser ships without write targets. Data is parsed and discarded or stored as raw BSON blobs with no queryable structure. Phase 1a exit criteria (parsed encounter/medication data shows in POCAR UI) cannot be met.
+Owner: Constantine (Backend/DNA)
+Blocker: No CCDA adapter can be implemented until persistence targets are defined for each entity.
+Impact if deferred: The CCDA adapters ship without write targets. Data is parsed and discarded or stored as raw BSON blobs with no queryable structure. Phase 1a exit criteria (encounter and medication data shows in POCAR UI) cannot be met.
 
 ---
 
@@ -100,7 +100,7 @@ Question: Is `persona.diagnoses[]` (PAI-184) the canonical store for all chronic
 Options:
   A. `persona.diagnoses[]` is canonical. CCDA problem list section maps to `PersonaDiagnosis` with `source=ATHENA_CCDA`. `PatientCarePlans.problemList` becomes read-only legacy, migrated or deprecated on a separate ticket.
   B. Both stores are maintained in parallel. CCDA problem list maps to `PersonaProblem` (thin wrapper over `problemList`) and separately to `PersonaDiagnosis`. A reconciliation policy is required.
-Owner: Backend, DNA (flagged as the single most important question for these teams in data-model-gaps.md, "Open Questions")
+Owner: Constantine (Backend/DNA) — flagged as the single most important question for these teams in data-model-gaps.md, "Open Questions"
 Blocker: CCDA problem list mapper cannot be written. Routing logic for CCDA Condition resources is undefined.
 Impact if deferred: Two separate write paths are implemented without a canonical owner. Downstream queries (dbt, Customer.io via ETL-service) read from an inconsistent source depending on which path ran last.
 
@@ -111,9 +111,9 @@ Question: Who owns the addition of `ATHENA_CCDA` and `ATHENA_BULK_FHIR` values t
 Options:
   A. Backend owns the enum change. Ships as a prerequisite ticket before Phase 1a integration code begins.
   B. Integration layer team owns the enum change as part of Phase 1a kickoff. Backend reviews.
-Owner: Backend
+Owner: Constantine (Backend)
 Blocker: Any integration-layer code that writes to `persona.diagnoses[]` will fail enum validation until these values exist. This is a 1-2 hour change (data-model-gaps.md, "Sequencing Plan, Phase 1a, item 1") but it must ship before integration code can be tested end-to-end.
-Impact if deferred: Integration layer code cannot write diagnoses in Phase 1a. The CCDA mapper's diagnosis section is dead code until the enum ships.
+Impact if deferred: Integration layer code cannot write diagnoses in Phase 1a. The diagnosis adapter is dead code until the enum ships.
 
 ---
 
@@ -122,8 +122,8 @@ Question: Do EHR-sourced historical vital signs (from CCDA vital-signs section) 
 Options:
   A. Extend `activity` collection — add `ATHENA_CCDA` and `ATHENA_BULK_FHIR` to `ActivitySource.SourceType`. Lowest friction, reuses existing billing/display infrastructure.
   B. New `PersonaVital` collection — separates EHR-sourced history from device readings. Cleaner FHIR alignment but requires a new display path and care-nexus propagation path.
-Owner: Backend, DNA
-Blocker: CCDA vital-signs section mapper has no write target until this is resolved.
+Owner: Constantine (Backend/DNA)
+Blocker: CCDA vital-signs adapter has no write target until this is resolved.
 Impact if deferred: EHR-sourced vitals are either discarded, stored as raw BSON, or written to `activity` by default. If written to `activity` without explicit decision, dbt billing models that assume all `activity` records are device-sourced may count EHR-historical vitals in RPM billing calculations (data-model-gaps.md, "Open Questions" — activity collection safe extension question).
 
 ---
@@ -156,7 +156,8 @@ Options:
   A. AWS SQS — used by services-data for device data (`QueueAlias.BROOK`, `BROOK_PLUS`, `NOTIFICATIONS`) and by brook-backend `DataBusScheduler`. Existing patterns in brook-backend.
   B. MongoDB CDC — used by care-nexus, watching `persona` and related collections. No SQS involved.
   C. Redis Streams (Valkey) — used by data-platform CIO service. Different infra from SQS entirely.
-Owner: Backend (architecture decision; involves infra team)
+  D. Kafka — EDA-native, durable log, replay-safe. No existing Brook precedent found in scanned repos; would require new infra. PM preference.
+Owner: Backend + infra (architecture decision). PM preference is Kafka / EDA (Option D) but defers to engineering on feasibility and infra lift.
 Blocker: Phase 0 Foundation scope. Event bus contracts cannot be defined until the substrate is selected. The build plan states "existing SQS-backed worker pattern is the substrate" but recon found three separate substrates in production (findings.md, "Event bus substrate"). The "Integration Event Worker (Go)" cited in the plan was not found in any scanned repo (findings.md, "Plan Assumptions I Could Not Verify" #1).
 Impact if deferred: Phase 0 exits without a committed event contract. Phases 1a-5 all emit events — if the substrate is undecided, integration event handlers are prototyped on an assumed substrate that may not be the one infra provisions.
 
@@ -229,7 +230,7 @@ Impact if deferred: New athena endpoints may fire in production for partners not
 | Epic Title | Description | Phase | Status |
 |------------|-------------|-------|--------|
 | P0: Integration Platform Foundation | Build partner-agnostic event bus contracts, auth scaffolding, HTTP client wiring, mapping config schema, and observability. | P0 | Greenfield (no existing implementation; ExponentialBackoffInterceptor wiring is a 1-day task not a build) |
-| P1a: CCDA Inbound | Build GET CCDA retrieval, CDA parser, entity mappers, and POCAR on-demand trigger. | P1a | Greenfield (OAuth2 client reused; all else new) |
+| P1a: CCDA Inbound | Build GET CCDA retrieval, CDA parser, CCDA adapters (encounter, medication, allergy, diagnosis, lab, vital), and POCAR on-demand trigger. | P1a | Greenfield (OAuth2 client reused; all else new) |
 | P1b: Clinical Document Upload | Refactor live AthenaService.java and AthenaApi.java to mapping-config-driven, event-driven architecture. | P1b | Refactor of live shipping code |
 | P2: Orders | Build athena orders ingest and patient activation flow. | P2 | Greenfield; blocked on external decisions |
 | P3: Bulk FHIR Patient Population Ingest | Build three-step async FHIR export, nightly sync, and idempotent upsert. | P3 | Greenfield |
@@ -330,17 +331,19 @@ Decision points: None
 
 ---
 
-#### P1a: CCDA Inbound / CCDA-to-Persona Entity Mappers
+#### P1a: CCDA Inbound / CCDA Entity Adapters
 
-Description: Implement mapping layer transforms from parsed CCDA section objects to PersonaDiagnosis, PersonaEncounter, PersonaMedication, PersonaAllergy, PersonaLab, and PersonaVital write calls, using the mapping config schema defined in P0.
+Description: Implement six CCDA adapters in the platform layer, one per clinical entity: encounter adapter, medication adapter, allergy adapter, diagnosis adapter, lab adapter, and vital adapter. Each adapter transforms parsed CCDA section objects into the corresponding Persona write calls using the mapping config schema defined in P0.
 Acceptance criteria:
-  - Each mapper has a unit test that takes a parsed CCDA section object and asserts the correct Brook entity fields are populated.
-  - DiagnosisSource.ATHENA_CCDA is used for all diagnosis writes (depends on DiagnosisSource enum extension ticket).
-  - Mappers read from the Griffin v0 config file, not from hardcoded field names.
-  - A mapper unit test asserts that an unrecognized CCDA section does not throw an exception but logs a warning.
+  - Each adapter has a unit test that takes a parsed CCDA section object and asserts the correct Brook entity fields are populated.
+  - DiagnosisSource.ATHENA_CCDA is used for all diagnosis adapter writes (depends on DiagnosisSource enum extension ticket).
+  - Adapters read from the Griffin v0 config file, not from hardcoded field names.
+  - An adapter unit test asserts that an unrecognized CCDA section does not throw an exception but logs a warning.
 Complexity: L
 Dependencies: CDA Parser Integration, P0 Mapping Config Schema, DiagnosisSource Enum Extension, persistence decisions for all entities (Decision 1)
 Decision points: Decisions 1, 2, 3
+
+
 
 ---
 
@@ -354,7 +357,7 @@ Acceptance criteria:
   - The last_pocar_opened_at signal in care-nexus is not used as an automatic trigger in v1 (manual nurse action only, per Phase 1a scope).
   - Integration Health Dashboard receives a log entry on each trigger invocation.
 Complexity: M
-Dependencies: CCDA Retrieval Endpoint, CCDA-to-Persona Entity Mappers
+Dependencies: CCDA Retrieval Endpoint, CCDA Entity Adapters
 Decision points: None
 
 ---
@@ -367,7 +370,7 @@ Acceptance criteria:
   - The idempotency key is stored in EmrLog or an equivalent dedup store with a TTL or version-based eviction policy.
   - A test fires the CCDA ingest handler twice with the same document and asserts the entity counts in each target collection are unchanged after the second call.
 Complexity: S
-Dependencies: CCDA-to-Persona Entity Mappers
+Dependencies: CCDA Entity Adapters
 Decision points: None
 
 ---
