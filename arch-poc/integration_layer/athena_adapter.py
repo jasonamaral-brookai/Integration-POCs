@@ -45,8 +45,25 @@ import hashlib
 import logging
 import time
 from datetime import date
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Set
 from integration_layer.auth import AthenaOAuth2Client
+from integration_layer.base_adapter import (
+    AdapterCapabilities,
+    AdapterContext,
+    AuthToken,
+    BaseEhrAdapter,
+    BrookEhrError,
+    BrookEhrErrorCode,
+    ClinicalDocument,
+    ClinicalSnapshot,
+    DocumentUploadResult,
+    EhrErrorResponse,
+    HealthCheckResult,
+    MayOperation,
+    PatientDemographics,
+    PatientMatchResult,
+    ShouldOperation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -311,15 +328,15 @@ class RetryExhaustedError(Exception):
     pass
 
 
-class AthenaAdapter:
+class AthenaAdapter(BaseEhrAdapter):
     """
-    Layer 1: Partner-specific adapter for the athena EHR.
+    Layer 1: athena EHR adapter — implements the Brook EhrAdapter contract.
 
-    Responsibilities:
-      - Authenticate with athena OAuth2 (delegates to AthenaOAuth2Client)
-      - Retrieve CCDA documents from athena API
-      - Handle retries, rate limiting (429), and exponential backoff
-      - Generate idempotency keys for inbound document retrieval
+    Contract tier coverage (see spec/adapter-contract.md):
+      MUST:   authenticate, scope_context, match_patient, get_capabilities,
+              map_error, with_idempotency_key, health_check
+      SHOULD: get_clinical_snapshot (Phase 1a), upload_document (Phase 1b)
+      MAY:    subscribe (Phase 3, alpha)
 
     This is a MOCKED adapter — it does not make real HTTP calls.
     That is wire-poc's job. This POC demonstrates the structural pattern.
@@ -350,6 +367,93 @@ class AthenaAdapter:
         self.initial_delay_seconds = initial_delay_seconds
         self.backoff_multiplier = backoff_multiplier
         self.max_delay_seconds = max_delay_seconds
+
+    # ── MUST implementations ───────────────────────────────────────────────────
+
+    def authenticate(self) -> AuthToken:
+        token = self.auth_client.get_bearer_token()
+        return AuthToken(access_token=token)
+
+    def scope_context(self, practice_id: str, patient_id: str) -> AdapterContext:
+        token = self.authenticate()
+        return AdapterContext(
+            practice_id=practice_id,
+            patient_id=patient_id,
+            ehr_name="athena",
+            auth_token=token,
+        )
+
+    def match_patient(self, demographics: PatientDemographics) -> PatientMatchResult:
+        # MOCKED — production calls POST /v1/{practiceid}/patients/enterprisepatientlookup
+        logger.info(
+            "adapter: match_patient MOCKED for %s %s",
+            demographics.first_name, demographics.last_name,
+        )
+        return PatientMatchResult(matched=True, ehr_patient_id="PAT-001-MOCK")
+
+    def get_capabilities(self) -> AdapterCapabilities:
+        return AdapterCapabilities(
+            ehr_name="athena",
+            adapter_version="1.0.0-poc",
+            should_ops={
+                ShouldOperation.CLINICAL_SNAPSHOT,
+                ShouldOperation.UPLOAD_DOCUMENT,
+            },
+            may_ops=set(),
+        )
+
+    def map_error(self, ehr_error: EhrErrorResponse) -> BrookEhrError:
+        if ehr_error.http_status == 429:
+            code = BrookEhrErrorCode.RATE_LIMITED
+        elif ehr_error.http_status == 404:
+            code = BrookEhrErrorCode.NOT_FOUND
+        elif ehr_error.http_status in (401, 403):
+            code = BrookEhrErrorCode.AUTH_FAILED
+        elif ehr_error.http_status == 400:
+            code = (
+                BrookEhrErrorCode.PATIENT_NOT_FOUND
+                if "INVALID_PATIENT" in ehr_error.body
+                else BrookEhrErrorCode.VALIDATION_ERROR
+            )
+        elif ehr_error.http_status >= 500:
+            code = BrookEhrErrorCode.TRANSIENT
+        else:
+            code = BrookEhrErrorCode.UNKNOWN
+        return BrookEhrError(
+            code=code,
+            ehr_name="athena",
+            http_status=ehr_error.http_status,
+            message=ehr_error.body,
+        )
+
+    def with_idempotency_key(self, key: str, operation: Callable) -> Any:
+        logger.info("adapter: attaching idempotency key %s", key)
+        return operation()
+
+    def health_check(self) -> HealthCheckResult:
+        # MOCKED — production calls GET /v1/{practiceid}/departments?limit=1
+        start = time.time()
+        try:
+            self.auth_client.get_bearer_token()
+            latency_ms = (time.time() - start) * 1000
+            return HealthCheckResult(healthy=True, latency_ms=latency_ms)
+        except Exception as exc:
+            return HealthCheckResult(healthy=False, error=str(exc))
+
+    # ── SHOULD implementations ─────────────────────────────────────────────────
+
+    def get_clinical_snapshot(self, context: AdapterContext) -> ClinicalSnapshot:
+        """Wraps get_ccda() to satisfy the adapter contract."""
+        result = self.get_ccda(patient_id=context.patient_id)
+        return ClinicalSnapshot(
+            raw_payload=result["xml"],
+            payload_type="CCDA",
+            patient_id=result["patient_id"],
+            practice_id=result["practice_id"],
+            idempotency_key=result["idempotency_key"],
+        )
+
+    # ── Athena-specific helpers ────────────────────────────────────────────────
 
     def generate_idempotency_key(
         self,
