@@ -25,6 +25,10 @@ spec/
     PersonaAllergy.java
     PersonaLab.java
     PersonaVital.java
+  code-proposals/                 # Ticket-level implementation specs for brook-backend engineers
+    PAI-416-exponential-backoff-wiring.md
+    PAI-443-diagnosissource-enum-extension.md
+    [additional proposals per Linear ticket]
   linear-project.md               # Linear-ready project spec
   dev-ready-report.md             # Dev-readiness review: verdict + blockers
 
@@ -96,9 +100,9 @@ Import the Postman collection (`postman-collection.json` in each pillar dir) for
 
 ## What This Is Not
 
-- Not a PR to any Brook repo
+- Not a PR to any Brook repo. `spec/code-proposals/` contains implementation specs for engineers to carry into brook-backend — they are reference documents, not commits or pull requests.
 - Not a production-ready integration layer
-- Not a claims about what Brook's architecture is — every finding cites real file paths or is flagged as "assumption, needs verification"
+- Not claims about what Brook's architecture is — every finding cites real file paths or is flagged as "assumption, needs verification"
 
 ---
 
